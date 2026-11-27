@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pinch Catch</title>
+<style>
+  :root { --ink:#f4efe6; --night:#10151c; --teal:#2fd3c0; --amber:#ffb83d; --coral:#ff6b5a; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--night); color:var(--ink); font-family:"Trebuchet MS",system-ui,sans-serif; overflow:hidden; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; touch-action:none; }
+  video { display:none; }
+  #hud { position:fixed; top:env(safe-area-inset-top,0px); left:0; right:0; display:flex; justify-content:space-between; padding:14px 18px; font-size:22px; font-weight:700; pointer-events:none; text-shadow:0 2px 6px rgba(0,0,0,.6); }
+  #panel { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:24px; text-align:center; background:rgba(16,21,28,.82); }
+  #panel h1 { margin:0; font-size:44px; letter-spacing:-.5px; }
+  #panel p { margin:0; max-width:30ch; line-height:1.5; opacity:.9; }
+  button { font:inherit; font-weight:700; font-size:18px; padding:14px 28px; border:0; border-radius:14px; background:var(--teal); color:#06231f; }
+  button:focus-visible { outline:3px solid var(--amber); outline-offset:3px; }
+  #msg { min-height:1.2em; color:var(--amber); font-size:14px; }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="hud" hidden><span id="score">Score 0</span><span id="lives"></span></div>
+<div id="panel">
+  <h1>Pinch Catch</h1>
+  <p>Pinch your thumb and index finger to grab a block. Let go to throw it into the basket.</p>
+  <button id="start">Start camera</button>
+  <div id="msg"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const video = document.getElementById('cam');
+const panel = document.getElementById('panel'), msg = document.getElementById('msg');
+const hud = document.getElementById('hud'), scoreEl = document.getElementById('score'), livesEl = document.getElementById('lives');
+let W = 0, H = 0;
+function resize(){ const d = devicePixelRatio || 1; W = innerWidth; H = innerHeight; cv.width = W*d; cv.height = H*d; ctx.setTransform(d,0,0,d,0,0); }
+addEventListener('resize', resize); resize();
+
+const COLORS = ['#2fd3c0','#ffb83d','#ff6b5a','#8fa8ff'];
+let objs = [], hands = [], score = 0, lives = 5, running = false, spawnT = 0, last = 0, sending = false;
+const holds = [ {obj:null, pinched:false, px:0, py:0, vx:0, vy:0}, {obj:null, pinched:false, px:0, py:0, vx:0, vy:0} ];
+
+function map(l){
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(W/vw, H/vh), ox = (W - vw*s)/2, oy = (H - vh*s)/2;
+  return { x: ox + (1 - l.x)*vw*s, y: oy + l.y*vh*s };
+}
+function bin(){ const w = Math.min(W*0.34, 220); return { x: W/2 - w/2, y: H - 90, w, h: 90 }; }
+
+function spawn(){
+  const r = 26 + Math.random()*14;
+  objs.push({ x: r + Math.random()*(W - 2*r), y: -r, vx: (Math.random()-.5)*60, vy: 40 + Math.random()*40, r, c: COLORS[(Math.random()*COLORS.length)|0], rot: Math.random()*6, held:false });
+}
+
+function updateHands(res){
+  hands = (res.multiHandLandmarks || []).slice(0,2).map(lm => {
+    const p = lm.map(map);
+    const size = Math.hypot(lm[0].x-lm[9].x, lm[0].y-lm[9].y) || .1;
+    const ratio = Math.hypot(lm[4].x-lm[8].x, lm[4].y-lm[8].y) / size;
+    return { p, ratio, cx: (p[4].x+p[8].x)/2, cy: (p[4].y+p[8].y)/2 };
+  });
+}
+
+function handLogic(dt){
+  for (let i=0;i<2;i++){
+    const h = hands[i], s = holds[i];
+    if (!h){ if (s.obj){ s.obj.held = false; s.obj = null; } s.pinched = false; continue; }
+    const wasPinched = s.pinched;
+    if (!s.pinched && h.ratio < 0.38) s.pinched = true;
+    else if (s.pinched && h.ratio > 0.55) s.pinched = false;
+    const ivx = (h.cx - s.px)/Math.max(dt,.001), ivy = (h.cy - s.py)/Math.max(dt,.001);
+    s.vx += (ivx - s.vx)*0.4; s.vy += (ivy - s.vy)*0.4;
+    s.px = h.cx; s.py = h.cy;
+    if (s.pinched && !wasPinched && !s.obj){
+      let best = null, bd = 1e9;
+      for (const o of objs){ if (o.held) continue; const d = Math.hypot(o.x-h.cx, o.y-h.cy); if (d < o.r + 50 && d < bd){ best = o; bd = d; } }
+      if (best){ best.held = true; s.obj = best; }
+    }
+    if (s.obj){
+      if (s.pinched){ s.obj.x += (h.cx - s.obj.x)*0.5; s.obj.y += (h.cy - s.obj.y)*0.5; s.obj.vx = 0; s.obj.vy = 0; }
+      else { const m = 1100; s.obj.vx = Math.max(-m, Math.min(m, s.vx)); s.obj.vy = Math.max(-m, Math.min(m, s.vy)); s.obj.held = false; s.obj = null; }
+    }
+  }
+}
+
+function physics(dt){
+  const b = bin();
+  for (let i = objs.length-1; i>=0; i--){
+    const o = objs[i]; if (o.held) continue;
+    o.vy += 520*dt; o.x += o.vx*dt; o.y += o.vy*dt; o.rot += o.vx*dt*0.01;
+    if (o.x < o.r){ o.x = o.r; o.vx = Math.abs(o.vx)*.7; }
+    if (o.x > W-o.r){ o.x = W-o.r; o.vx = -Math.abs(o.vx)*.7; }
+    if (o.vy > 0 && o.x > b.x && o.x < b.x+b.w && o.y > b.y+10 && o.y < b.y+b.h){ objs.splice(i,1); score++; scoreEl.textContent = 'Score ' + score; continue; }
+    if (o.y - o.r > H){ objs.splice(i,1); lives--; drawLives(); if (lives <= 0) end(); }
+  }
+}
+
+function drawLives(){ livesEl.textContent = '\u2665'.repeat(Math.max(lives,0)); }
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  if (video.readyState >= 2){
+    const vw = video.videoWidth, vh = video.videoHeight, s = Math.max(W/vw, H/vh);
+    ctx.save(); ctx.translate(W,0); ctx.scale(-1,1);
+    ctx.drawImage(video, (W - vw*s)/2, (H - vh*s)/2, vw*s, vh*s); ctx.restore();
+    ctx.fillStyle = 'rgba(16,21,28,.35)'; ctx.fillRect(0,0,W,H);
+  }
+  const b = bin();
+  ctx.fillStyle = 'rgba(244,239,230,.15)'; ctx.strokeStyle = '#f4efe6'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(b.x+10, b.y+b.h); ctx.lineTo(b.x+b.w-10, b.y+b.h); ctx.lineTo(b.x+b.w, b.y); ctx.fill(); ctx.stroke();
+  for (const o of objs){
+    ctx.save(); ctx.translate(o.x,o.y); ctx.rotate(o.rot);
+    ctx.fillStyle = o.c; ctx.shadowColor = 'rgba(0,0,0,.5)'; ctx.shadowBlur = o.held ? 22 : 8;
+    ctx.fillRect(-o.r,-o.r,o.r*2,o.r*2); ctx.restore();
+  }
+  for (const h of hands){
+    ctx.strokeStyle = 'rgba(244,239,230,.75)'; ctx.lineWidth = 3;
+    const bones = [[0,1,2,3,4],[0,5,6,7,8],[9,10,11,12],[13,14,15,16],[0,17,18,19,20],[5,9,13,17]];
+    for (const ch of bones){ ctx.beginPath(); ch.forEach((k,j)=> j ? ctx.lineTo(h.p[k].x,h.p[k].y) : ctx.moveTo(h.p[k].x,h.p[k].y)); ctx.stroke(); }
+    const pinched = h.ratio < 0.45;
+    ctx.fillStyle = pinched ? '#ffb83d' : '#2fd3c0';
+    ctx.beginPath(); ctx.arc(h.cx, h.cy, pinched ? 14 : 9, 0, 7); ctx.fill();
+  }
+}
+
+function frame(t){
+  const dt = Math.min((t - last)/1000, .05); last = t;
+  if (running){
+    spawnT -= dt; if (spawnT <= 0){ spawn(); spawnT = Math.max(.7, 1.9 - score*0.03); }
+    handLogic(dt); physics(dt);
+  }
+  draw();
+  if (video.readyState >= 2 && !sending && window.handsModel){
+    sending = true; handsModel.send({image: video}).catch(()=>{}).finally(()=>{ sending = false; });
+  }
+  requestAnimationFrame(frame);
+}
+
+function end(){
+  running = false; hud.hidden = true;
+  panel.querySelector('h1').textContent = 'Game over';
+  panel.querySelector('p').textContent = 'You caught ' + score + (score === 1 ? ' block.' : ' blocks.');
+  document.getElementById('start').textContent = 'Play again';
+  panel.hidden = false;
+}
+function begin(){ objs = []; score = 0; lives = 5; spawnT = 0; scoreEl.textContent = 'Score 0'; drawLives(); hud.hidden = false; panel.hidden = true; running = true; }
+
+document.getElementById('start').addEventListener('click', async () => {
+  if (window.handsModel){ begin(); return; }
+  msg.textContent = 'Starting camera\u2026';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 640, height: 480 }, audio: false });
+    video.srcObject = stream; await video.play();
+    const m = new Hands({ locateFile: f => 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/' + f });
+    m.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: .6, minTrackingConfidence: .5 });
+    m.onResults(updateHands);
+    msg.textContent = 'Loading hand tracking\u2026';
+    await m.initialize();
+    window.handsModel = m; msg.textContent = ''; begin();
+  } catch (e) {
+    msg.textContent = 'Camera or hand tracking could not start. Open this page over https or localhost and allow camera access.';
+  }
+});
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
